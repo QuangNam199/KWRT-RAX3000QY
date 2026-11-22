@@ -1,0 +1,85 @@
+name: Build KWRT 25.12 for CMCC RAX3000-QY
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [.github/workflows/build-kwrt.yml]
+
+permissions:
+  contents: read
+
+env:
+  KWRT_URL: https://dl.openwrt.ai/releases/25.12/targets/qualcommax/ipq50xx
+  PROFILE: cmcc_rax3000q
+  TARGET: qualcommax/ipq50xx
+  ARCHIVE: kwrt-imagebuilder-qualcommax-ipq50xx.Linux-x86_64.tar.zst
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Install ImageBuilder dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y build-essential file gawk gettext libncurses-dev libssl-dev python3 rsync unzip xsltproc zlib1g-dev zstd jq
+
+      - name: Download and verify KWRT 25.12 ImageBuilder
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/kwrt" "$GITHUB_WORKSPACE/diagnostics"
+          cd "$RUNNER_TEMP/kwrt"
+          curl -fsSL --retry 3 --retry-all-errors --connect-timeout 20 --max-time 90 -o sha256sums "$KWRT_URL/sha256sums" 2> >(tee "$GITHUB_WORKSPACE/diagnostics/download.log" >&2)
+          awk -v archive="$ARCHIVE" '$2 == archive || $2 == "*" archive { print $1 "  " archive; found++ } END { if (found != 1) exit 1 }' sha256sums > imagebuilder.sha256
+          curl -fsSL --retry 3 --retry-all-errors --connect-timeout 20 --max-time 600 -o "$ARCHIVE" "$KWRT_URL/$ARCHIVE" 2> >(tee -a "$GITHUB_WORKSPACE/diagnostics/download.log" >&2)
+          sha256sum -c imagebuilder.sha256
+          cp imagebuilder.sha256 "$GITHUB_WORKSPACE/diagnostics/"
+          printf '%s\n' "$KWRT_URL/$ARCHIVE" > "$GITHUB_WORKSPACE/diagnostics/imagebuilder-url.txt"
+          mkdir builder
+          tar --zstd -xf "$ARCHIVE" -C builder --strip-components=1
+          test -f builder/Makefile
+
+      - name: Verify profile and build firmware
+        shell: bash
+        run: |
+          cd "$RUNNER_TEMP/kwrt/builder"
+          make info 2>&1 | tee "$GITHUB_WORKSPACE/diagnostics/imagebuilder-info.log"
+          grep -Eq "^[[:space:]]*$PROFILE:" "$GITHUB_WORKSPACE/diagnostics/imagebuilder-info.log"
+          make image PROFILE="$PROFILE" 2>&1 | tee "$GITHUB_WORKSPACE/diagnostics/build.log"
+
+      - name: Verify firmware metadata and checksums
+        shell: bash
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/firmware"
+          cd "$RUNNER_TEMP/kwrt/builder/bin/targets/$TARGET"
+          jq -e --arg target "$TARGET" --arg profile "$PROFILE" '(.target == $target) and (.profiles[$profile] != null)' profiles.json
+          for type in sysupgrade factory; do
+            image=$(jq -er --arg profile "$PROFILE" --arg type "$type" '.profiles[$profile].images[] | select(.type == $type and .filesystem == "squashfs") | .name' profiles.json)
+            [[ "$image" == "kwrt-"*"-"$PROFILE"-squashfs-"$type"."* && "$image" != */* ]]
+            test -s "$image"
+            expected=$(jq -er --arg profile "$PROFILE" --arg image "$image" '.profiles[$profile].images[] | select(.name == $image) | .sha256 | select(test("^[a-f0-9]{64}$"))' profiles.json)
+            printf '%s  %s\n' "$expected" "$image" | sha256sum -c -
+            cp "$image" "$GITHUB_WORKSPACE/firmware/"
+          done
+          cp profiles.json "$GITHUB_WORKSPACE/firmware/"
+          find . -maxdepth 1 -type f -name "*-$PROFILE.manifest" -exec cp -t "$GITHUB_WORKSPACE/firmware" {} +
+          cd "$GITHUB_WORKSPACE/firmware"
+          cp "$GITHUB_WORKSPACE"/diagnostics/imagebuilder-{url.txt,sha256} .
+          sha256sum -- * | tee SHA256SUMS
+          sha256sum -c SHA256SUMS
+          ls -lh
+
+      - name: Upload verified firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: kwrt-25.12-qualcommax-ipq50xx-cmcc_rax3000q
+          path: firmware/
+          if-no-files-found: error
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kwrt-build-diagnostics
+          path: diagnostics/
+          if-no-files-found: ignore
