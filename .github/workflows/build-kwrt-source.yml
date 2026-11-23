@@ -1,0 +1,140 @@
+name: Build KWRT 25.12 from source
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [.github/workflows/build-kwrt-source.yml]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    defaults:
+      run:
+        shell: bash
+    env:
+      KWRT_SHA: 8461dfbe9f8ff49f23f03a65fcbba1bd42a524dd
+      OPENWRT_SHA: 8d054d984a54c9ff4a733b14cd7400742e844b46
+      IPQ50XX_SHA: 14a07b78e9ac9d604547533550e6aa41955ac588
+      PROFILE: cmcc_rax3000q
+      TARGET: qualcommax/ipq50xx
+    steps:
+      - name: Install build dependencies
+        run: |
+          mkdir -p diagnostics firmware
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          sudo apt-get update -qq
+          sudo apt-get install -y build-essential clang flex bison gawk gcc-multilib g++-multilib \
+            gettext git libncurses-dev libssl-dev python3-setuptools rsync swig unzip zlib1g-dev \
+            file wget dwarves llvm python3-pyelftools libpython3-dev jq qemu-utils rename \
+            libelf-dev device-tree-compiler libgmp-dev libmpc-dev libfuse-dev zstd xsltproc
+          df -h .
+      - name: Prepare KWRT and validate device profile
+        run: |
+          git init -q kwrt
+          git -C kwrt fetch --depth=1 https://github.com/kiddin9/Kwrt.git "$KWRT_SHA"
+          git -C kwrt checkout --detach FETCH_HEAD
+          git init -q openwrt
+          git -C openwrt fetch --depth=1 https://github.com/openwrt/openwrt.git "$OPENWRT_SHA"
+          git -C openwrt checkout --detach FETCH_HEAD
+          git_clone_path() (
+            set -e
+            ref="$1" url="$2"
+            shift 2
+            keep_existing=false
+            if [[ "$1" == mv ]]; then
+              keep_existing=true
+              shift
+            fi
+            if [[ "$url" == https://github.com/openwrt/openwrt && "$ref" == main ]]; then
+              ref="$IPQ50XX_SHA"
+            fi
+            tmp=$(mktemp -d)
+            trap 'rm -rf "$tmp"' EXIT
+            git -C "$tmp" init -q
+            git -C "$tmp" remote add origin "$url"
+            git -C "$tmp" sparse-checkout set --cone "$@"
+            git -C "$tmp" fetch --depth=1 --filter=blob:none origin "$ref"
+            git -C "$tmp" checkout --detach FETCH_HEAD
+            for path in "$@"; do
+              mkdir -p "$path"
+              if "$keep_existing"; then
+                cp -an "$tmp/$path/." "$path/"
+              else
+                cp -a "$tmp/$path/." "$path/"
+              fi
+            done
+          )
+          export -f git_clone_path
+          cd openwrt
+          common=../kwrt/devices/common
+          device=../kwrt/devices/qualcommax_ipq50xx
+          cp -a "$common/." .
+          cp -a "$device/." .
+          # Skip the upstream wait for the maintainer's package CI.
+          sed '/^status=$(curl /,/^done$/d' "$common/diy.sh" > "$RUNNER_TEMP/common.sh"
+          sed "s@/refs/heads/main/include/@/$IPQ50XX_SHA/include/@g" "$device/diy.sh" > "$RUNNER_TEMP/ipq50xx.sh"
+          bash "$RUNNER_TEMP/common.sh" 2>&1 | tee "$GITHUB_WORKSPACE/diagnostics/common.log"
+          bash "$RUNNER_TEMP/ipq50xx.sh" 2>&1 | tee "$GITHUB_WORKSPACE/diagnostics/ipq50xx.log"
+          if [[ -d diy ]]; then cp -a diy/. .; fi
+          mkdir -p "$RUNNER_TEMP/patches"
+          cp -a "$common/patches/." "$device/patches/." "$RUNNER_TEMP/patches/"
+          while IFS= read -r -d '' item; do
+            case "$item" in
+              *.bin.patch) git apply "$item" ;;
+              *.revert.patch) patch -R --batch -p1 -F1 -i "$item" ;;
+              *) patch --batch -p1 -F1 -i "$item" ;;
+            esac
+          done < <(find "$RUNNER_TEMP/patches" -maxdepth 1 -name '*.patch' -print0 | sort -z)
+          definition=target/linux/qualcommax/image/ipq50xx.mk
+          awk -v p="$PROFILE" '$0 == "define Device/" p {found=1} found {print} found && $0 == "endef" {exit}' "$definition" \
+            | tee "$GITHUB_WORKSPACE/diagnostics/device.txt"
+          grep -Eq 'SOC[[:space:]]*:=[[:space:]]*ipq5018$' "$GITHUB_WORKSPACE/diagnostics/device.txt"
+          grep -Fx "TARGET_DEVICES += $PROFILE" "$definition"
+          sed '/^CONFIG_TARGET_\(ALL_PROFILES\|MULTI_PROFILE\)=/d' "$common/.config" > .config
+          cat "$device/.config" >> .config
+          printf '\nCONFIG_TARGET_MULTI_PROFILE=y\n# CONFIG_TARGET_ALL_PROFILES is not set\nCONFIG_TARGET_qualcommax_ipq50xx_DEVICE_%s=y\n' "$PROFILE" >> .config
+          make defconfig
+          sed -n '/# Wireless Drivers/,/# end of Wireless Drivers/p' .config | sed 's/=m$/=n/' >> .config
+          sed -i 's/\(kmod-qca.*\)=m$/\1=n/' .config
+          make defconfig
+          grep -Fx "CONFIG_TARGET_qualcommax_ipq50xx_DEVICE_$PROFILE=y" .config
+          test "$(grep -Ec '^CONFIG_TARGET_qualcommax_ipq50xx_DEVICE_.*=y$' .config)" -eq 1
+          cp .config "$GITHUB_WORKSPACE/diagnostics/build.config"
+          printf 'kwrt %s\nopenwrt %s\nipq50xx %s\n' "$KWRT_SHA" "$OPENWRT_SHA" "$IPQ50XX_SHA" > "$GITHUB_WORKSPACE/diagnostics/source-revisions.txt"
+      - name: Compile firmware
+        working-directory: openwrt
+        run: |
+          make -j"$(nproc)" download 2>&1 | tee "$GITHUB_WORKSPACE/diagnostics/download.log"
+          if ! make -j"$(nproc)" 2>&1 | tee "$GITHUB_WORKSPACE/diagnostics/build.log"; then
+            make -j1 V=s 2>&1 | tee "$GITHUB_WORKSPACE/diagnostics/build-verbose.log"
+          fi
+      - name: Verify firmware and checksums
+        run: |
+          cd "openwrt/bin/targets/$TARGET"
+          jq -e --arg t "$TARGET" --arg p "$PROFILE" '.target == $t and (.profiles[$p] != null)' profiles.json
+          for type in factory sysupgrade; do
+            image=$(jq -er --arg p "$PROFILE" --arg t "$type" '.profiles[$p].images[] | select(.type == $t and .filesystem == "squashfs") | .name' profiles.json)
+            [[ "$image" == kwrt-*-"$PROFILE"-squashfs-"$type".* && "$image" != */* ]]
+            test -s "$image"
+            expected=$(jq -er --arg p "$PROFILE" --arg n "$image" '.profiles[$p].images[] | select(.name == $n) | .sha256 | select(test("^[a-f0-9]{64}$"))' profiles.json)
+            printf '%s  %s\n' "$expected" "$image" | sha256sum -c -
+            cp "$image" "$GITHUB_WORKSPACE/firmware/"
+          done
+          cp profiles.json "$GITHUB_WORKSPACE/diagnostics/source-revisions.txt" "$GITHUB_WORKSPACE/firmware/"
+          cd "$GITHUB_WORKSPACE/firmware"
+          sha256sum -- kwrt-* profiles.json source-revisions.txt > SHA256SUMS
+          sha256sum -c SHA256SUMS
+      - name: Upload verified firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: kwrt-25.12-source-cmcc_rax3000q
+          path: firmware/
+          if-no-files-found: error
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kwrt-source-diagnostics
+          path: diagnostics/
